@@ -54,6 +54,18 @@ PERSONA_STATE = {
 }
 # 绑定数据存储
 BINDFILE = Path("data/steam_verify/bindings.json")
+GROUP_SETTINGS_FILE = Path("data/steam_verify/group_settings.json")
+
+# 每群默认设置模板
+DEFAULT_GROUP_SETTINGS = {
+    "required_game_appids": [],     # 空=不检测游戏
+    "auto_approve_on_match": False, # 命中游戏是否自动通过
+    "auto_reject_vac": False,
+    "min_steam_level": 0,
+    "min_games_count": 0,
+    "no_game_action": "manual",     # manual / reject
+    "enabled": True,
+}
 # 自动下载的字体保存路径
 FONT_DIR = Path("data/fonts")
 FONT_FILE = FONT_DIR / "LXGWWenKai-Regular.ttf"
@@ -153,6 +165,9 @@ class SteamAPI:
             self.get_owned_games(steam64),
             self.get_recent_games(steam64),
         )
+        # 区分 "游戏详情私密"(API返回空{}) 和 "真的有0个游戏"(返回game_count=0)
+        # 如果 games_data 里连 game_count 键都没有，说明游戏列表不可见
+        games_visible = "game_count" in games_data
         return {
             "steam64": steam64,
             "summary": summary,
@@ -160,6 +175,7 @@ class SteamAPI:
             "level": level,
             "game_count": games_data.get("game_count", 0),
             "games": games_data.get("games", []),
+            "games_visible": games_visible,
             "recent_games": recent,
         }
 
@@ -450,6 +466,8 @@ class SteamVerifyPlugin(Star):
 
         # 每群绑定: { "群号": { "QQ号": "steam64", ... }, ... }
         self.bindings: Dict[str, Dict[str, str]] = self._load_bindings()
+        # 每群设置: { "群号": { "required_game_appids": [...], ... }, ... }
+        self.group_settings: Dict[str, dict] = self._load_group_settings()
 
         if self.steam_api:
             logger.info("[SteamVerify] ✅ Steam API 已初始化")
@@ -505,6 +523,45 @@ class SteamVerifyPlugin(Star):
     def _get_binding(self, group_id: str, qq_id: str) -> Optional[str]:
         """查询某人在某群的绑定"""
         return self.bindings.get(group_id, {}).get(qq_id)
+    # ==========================================================
+    #  群设置管理（每群独立）
+    # ==========================================================
+
+    def _load_group_settings(self) -> Dict[str, dict]:
+        try:
+            if GROUP_SETTINGS_FILE.exists():
+                data = json.loads(GROUP_SETTINGS_FILE.read_text(encoding="utf-8"))
+                logger.info(f"[SteamVerify] 已加载 {len(data)} 个群的设置")
+                return data
+        except Exception as e:
+            logger.error(f"[SteamVerify] 加载群设置失败: {e}")
+        return {}
+
+    def _save_group_settings(self):
+        try:
+            GROUP_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GROUP_SETTINGS_FILE.write_text(
+                json.dumps(self.group_settings, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            logger.error(f"[SteamVerify] 保存群设置失败: {e}")
+
+    def _get_gs(self, group_id: str) -> dict:
+        """获取某群的设置，没有就返回默认值副本"""
+        if group_id in self.group_settings:
+            # 合并默认值（防止旧数据缺新字段）
+            merged = dict(DEFAULT_GROUP_SETTINGS)
+            merged.update(self.group_settings[group_id])
+            return merged
+        return dict(DEFAULT_GROUP_SETTINGS)
+
+    def _set_gs(self, group_id: str, key: str, value):
+        """设置某群的某个配置项"""
+        if group_id not in self.group_settings:
+            self.group_settings[group_id] = dict(DEFAULT_GROUP_SETTINGS)
+        self.group_settings[group_id][key] = value
+        self._save_group_settings()
     async def _ensure_renderer(self):
         """首次使用时初始化渲染器（含字体下载）"""
         if self._font_ready:
@@ -623,6 +680,11 @@ class SteamVerifyPlugin(Star):
             )
             return
 
+        # ---- 拿本群设置 ----
+        gs = self._get_gs(group_id)
+        if not gs.get("enabled", True):
+            return  # 本群未启用
+
         # ---- 去重检查 ----
         dup_qq = self._check_steam_dup(group_id, steam64)
         if dup_qq:
@@ -633,7 +695,7 @@ class SteamVerifyPlugin(Star):
                     f"👤 申请人 QQ: {user_id}\n"
                     f"🎮 Steam64: {steam64}\n"
                     f"❗ 该 Steam 已被群内 QQ {dup_qq} 绑定\n"
-                    f"已自动拒绝，如需放行请手动处理"
+                    f"已自动拒绝"
                 }}],
             )
             try:
@@ -641,87 +703,77 @@ class SteamVerifyPlugin(Star):
                     flag=flag, sub_type="add", approve=False,
                     reason="Steam账号已被群内其他成员绑定"
                 )
-                logger.info(f"[SteamVerify] 🚫 重复Steam拒绝: QQ{user_id} steam={steam64} 已绑定QQ{dup_qq}")
             except Exception as e:
                 logger.error(f"[SteamVerify] 拒绝失败: {e}")
             return
 
-        # ---- 画卡片（无论自动还是手动都要发） ----
+        # ---- 画卡片 ----
         await self._ensure_renderer()
         avatar_url = profile["summary"].get("avatarfull") or profile["summary"].get("avatarmedium", "")
         avatar_img = await self.steam_api.download_image(avatar_url) if avatar_url else None
         card_bytes = self.renderer.render(profile, qq_id=user_id, avatar_img=avatar_img)
         card_b64 = base64.b64encode(card_bytes).decode()
 
-        # ---- 判断条件 ----
+        # ---- 基础条件检查 ----
         bans = profile.get("bans", {})
-        owned_appids = {g.get("appid") for g in profile.get("games", [])}
         level = profile.get("level", 0)
         game_count = profile.get("game_count", 0)
+        games_visible = profile.get("games_visible", False)
+        owned_appids = {g.get("appid") for g in profile.get("games", [])}
 
-        # VAC 检查
-        if self.config.get("auto_reject_vac") and bans.get("VACBanned"):
-            await client.send_group_msg(
-                group_id=notify_gid,
-                message=[{"type": "text", "data": {"text": f"📨 QQ {user_id}\n❌ 自动拒绝: VAC 封禁"}}],
-            )
-            await client.send_group_msg(
-                group_id=notify_gid,
-                message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
-            )
-            try:
-                await client.set_group_add_request(flag=flag, sub_type="add", approve=False, reason="VAC封禁")
-            except Exception as e:
-                logger.error(f"[SteamVerify] 拒绝失败: {e}")
+        # VAC
+        if gs.get("auto_reject_vac") and bans.get("VACBanned"):
+            await self._send_reject(client, notify_gid, flag, user_id, card_b64, "VAC 封禁")
             return
 
-        # 等级/游戏数检查
-        min_lvl = self.config.get("min_steam_level", 0)
-        min_g = self.config.get("min_games_count", 0)
-        block_reason = None
+        # 等级
+        min_lvl = gs.get("min_steam_level", 0)
         if min_lvl and level < min_lvl:
-            block_reason = f"等级 {level} < {min_lvl}"
-        if min_g and game_count < min_g:
-            block_reason = f"游戏数 {game_count} < {min_g}"
-        if block_reason:
-            await client.send_group_msg(
-                group_id=notify_gid,
-                message=[{"type": "text", "data": {"text": f"📨 QQ {user_id}\n❌ 自动拒绝: {block_reason}"}}],
-            )
-            await client.send_group_msg(
-                group_id=notify_gid,
-                message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
-            )
-            try:
-                await client.set_group_add_request(flag=flag, sub_type="add", approve=False, reason=block_reason)
-            except Exception as e:
-                logger.error(f"[SteamVerify] 拒绝失败: {e}")
+            await self._send_reject(client, notify_gid, flag, user_id, card_b64, f"等级 {level} < {min_lvl}")
             return
 
-        # ---- 核心判断：是否拥有必需游戏 ----
-        req_apps = self.config.get("required_game_appids", [4000])
-        has_required = bool(req_apps and any(a in owned_appids for a in req_apps))
-        # 资料私密时 owned_appids 为空，特殊处理
-        is_private = profile.get("summary", {}).get("communityvisibilitystate", 1) != 3
+        # 游戏数
+        min_g = gs.get("min_games_count", 0)
+        if min_g and games_visible and game_count < min_g:
+            await self._send_reject(client, notify_gid, flag, user_id, card_b64, f"游戏数 {game_count} < {min_g}")
+            return
 
+        # ---- 必需游戏检测 ----
+        req_apps = gs.get("required_game_appids", [])
         persona = profile["summary"].get("personaname", "")
 
-        if has_required:
-            # ===== 有必需游戏 → 自动通过 + 自动绑定 =====
+        if not req_apps:
+            # 本群没设必需游戏 → 全部发卡片手动审
+            await self._send_manual(client, notify_gid, flag, group_id, user_id, steam64, persona, card_b64, "本群未设置必需游戏")
+            return
+
+        if not games_visible:
+            # 游戏列表不可见（私密）→ 无法判断，交手动
+            logger.info(f"[SteamVerify] QQ{user_id} 游戏列表不可见，交手动审核")
+            await self._send_manual(client, notify_gid, flag, group_id, user_id, steam64, persona, card_b64, "🔒 游戏列表私密，无法自动检测")
+            return
+
+        # 检查是否拥有任一必需游戏
+        has_required = any(a in owned_appids for a in req_apps)
+        logger.info(f"[SteamVerify] QQ{user_id} 拥有游戏检测: required={req_apps} owned_count={len(owned_appids)} hit={has_required}")
+
+        if has_required and gs.get("auto_approve_on_match", False):
+            # ===== 自动通过 + 绑定 =====
             try:
                 await client.set_group_add_request(flag=flag, sub_type="add", approve=True)
                 self._bind(group_id, user_id, steam64)
-                logger.info(f"[SteamVerify] ✅ 自动通过: QQ{user_id} steam={steam64}")
+                logger.info(f"[SteamVerify] ✅ 自动通过: QQ{user_id}")
             except Exception as e:
                 logger.error(f"[SteamVerify] 自动通过失败: {e}")
 
+            req_names = ",".join(str(a) for a in req_apps)
             await client.send_group_msg(
                 group_id=notify_gid,
                 message=[{"type": "text", "data": {"text":
                     f"📨 加群申请 - 已自动通过 ✅\n"
                     f"👤 QQ: {user_id}\n"
                     f"🎮 Steam: {persona} ({steam64})\n"
-                    f"✅ 拥有必需游戏，已自动放行并绑定"
+                    f"✅ 拥有必需游戏({req_names})，已自动放行并绑定"
                 }}],
             )
             await client.send_group_msg(
@@ -730,49 +782,60 @@ class SteamVerifyPlugin(Star):
             )
             return
 
-        # ===== 没有必需游戏 / 私密资料 → 手动审核 =====
-        no_game_action = self.config.get("no_game_action", "manual")
-
-        if no_game_action == "reject" and not is_private:
-            # 配置为自动拒绝
-            await client.send_group_msg(
-                group_id=notify_gid,
-                message=[{"type": "text", "data": {"text":
-                    f"📨 QQ {user_id}\n❌ 自动拒绝: 未拥有必需游戏"
-                }}],
-            )
-            await client.send_group_msg(
-                group_id=notify_gid,
-                message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
-            )
-            try:
-                await client.set_group_add_request(flag=flag, sub_type="add", approve=False, reason="未拥有必需游戏")
-            except Exception as e:
-                logger.error(f"[SteamVerify] 拒绝失败: {e}")
+        if has_required and not gs.get("auto_approve_on_match", False):
+            # 有游戏但不自动通过 → 手动（提示有游戏）
+            await self._send_manual(client, notify_gid, flag, group_id, user_id, steam64, persona, card_b64, "✅ 拥有必需游戏（未开启自动通过）")
             return
 
-        # ===== 发卡片等管理员手动审批 =====
-        reason_hint = "🔒 资料私密，无法检测游戏" if is_private else "⚠ 未检测到必需游戏"
+        # 没有必需游戏
+        no_act = gs.get("no_game_action", "manual")
+        if no_act == "reject":
+            await self._send_reject(client, notify_gid, flag, user_id, card_b64, "未拥有必需游戏")
+            return
+
+        await self._send_manual(client, notify_gid, flag, group_id, user_id, steam64, persona, card_b64, "⚠ 未检测到必需游戏")
+
+    # ==========================================================
+    #  处理管理员引用回复（同意/拒绝）
+    # ==========================================================
+    async def _send_reject(self, client, gid: int, flag: str, user_id: str, card_b64: str, reason: str):
+        """发拒绝通知 + 执行拒绝"""
         await client.send_group_msg(
-            group_id=notify_gid,
+            group_id=gid,
+            message=[{"type": "text", "data": {"text": f"📨 QQ {user_id}\n❌ 自动拒绝: {reason}"}}],
+        )
+        await client.send_group_msg(
+            group_id=gid,
+            message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
+        )
+        try:
+            await client.set_group_add_request(flag=flag, sub_type="add", approve=False, reason=reason)
+            logger.info(f"[SteamVerify] 🚫 拒绝 QQ{user_id}: {reason}")
+        except Exception as e:
+            logger.error(f"[SteamVerify] 拒绝失败: {e}")
+
+    async def _send_manual(self, client, gid: int, flag: str, group_id: str,
+                           user_id: str, steam64: str, persona: str, card_b64: str, hint: str):
+        """发手动审核卡片"""
+        await client.send_group_msg(
+            group_id=gid,
             message=[{"type": "text", "data": {"text":
                 f"📨 新的加群申请（需手动审核）\n"
                 f"👤 QQ: {user_id} | 群: {group_id}\n"
                 f"🎮 Steam: {persona} ({steam64})\n"
-                f"{reason_hint}\n"
+                f"{hint}\n"
                 f"💡 请引用下方卡片回复「同意」或「拒绝」"
             }}],
         )
-
         try:
             result = await client.send_group_msg(
-                group_id=notify_gid,
+                group_id=gid,
                 message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
             )
             msg_id = None
             if isinstance(result, dict):
                 msg_id = str(result.get("message_id", ""))
-            if msg_id and msg_id != "0" and msg_id != "None":
+            if msg_id and msg_id not in ("0", "None", ""):
                 self.pending[msg_id] = {
                     "flag": flag,
                     "sub_type": "add",
@@ -781,16 +844,11 @@ class SteamVerifyPlugin(Star):
                     "steam64": steam64,
                     "timestamp": time.time(),
                 }
-                logger.info(f"[SteamVerify] 📋 卡片已发送 msg_id={msg_id}，等待手动审批")
+                logger.info(f"[SteamVerify] 📋 等待手动审批 msg_id={msg_id}")
             else:
-                logger.warning(f"[SteamVerify] ⚠ 未获取到 msg_id: {result}")
+                logger.warning(f"[SteamVerify] ⚠ 未获取 msg_id: {result}")
         except Exception as e:
-            logger.error(f"[SteamVerify] 发送卡片失败: {e}")
-
-    # ==========================================================
-    #  处理管理员引用回复（同意/拒绝）
-    # ==========================================================
-
+            logger.error(f"[SteamVerify] 发卡片失败: {e}")
     async def _on_group_msg(self, event: AstrMessageEvent, raw: dict):
         """群消息：检测管理员引用卡片回复"""
         if not self.pending:
@@ -968,7 +1026,8 @@ class SteamVerifyPlugin(Star):
             f"监控群: {mon_txt}\n"
             f"待审核: {len(self.pending)}\n"
             f"已处理: {len(self.processed_flags)}\n"
-            f"绑定数据: {sum(len(v) for v in self.bindings.values())} 条 / {len(self.bindings)} 个群"
+            f"绑定数据: {sum(len(v) for v in self.bindings.values())} 条 / {len(self.bindings)} 个群\n"
+            f"群设置: {len(self.group_settings)} 个群已配置"
         )
     @filter.command("steam_binds")
     async def cmd_binds(self, event: AstrMessageEvent):
@@ -1067,7 +1126,197 @@ class SteamVerifyPlugin(Star):
             yield event.plain_result(f"🔗 QQ {qq_id} → Steam64: {sid}\n🔗 https://steamcommunity.com/profiles/{sid}")
         else:
             yield event.plain_result(f"❌ QQ {qq_id} 在本群无绑定记录")
+    # ==========================================================
+    #  群设置命令（每群独立配置）
+    # ==========================================================
+
+    @filter.command("steam_setup")
+    async def cmd_setup(self, event: AstrMessageEvent):
+        """查看/初始化本群设置: /steam_setup"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        gs = self._get_gs(gid)
+        req_apps = gs.get("required_game_appids", [])
+        apps_txt = ", ".join(str(a) for a in req_apps) if req_apps else "未设置"
+        yield event.plain_result(
+            f"⚙ 群 {gid} 审核设置\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"启用审核: {'✅' if gs.get('enabled') else '❌'}\n"
+            f"必需游戏: {apps_txt}\n"
+            f"命中自动通过: {'✅' if gs.get('auto_approve_on_match') else '❌ (仅发卡片)'}\n"
+            f"无游戏时: {'自动拒绝' if gs.get('no_game_action')=='reject' else '手动审核'}\n"
+            f"VAC自动拒绝: {'✅' if gs.get('auto_reject_vac') else '❌'}\n"
+            f"最低等级: {gs.get('min_steam_level', 0)}\n"
+            f"最低游戏数: {gs.get('min_games_count', 0)}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"修改命令:\n"
+            f"  /steam_setgame <AppID> - 设置必需游戏\n"
+            f"  /steam_autopass on/off - 命中游戏自动通过\n"
+            f"  /steam_nogame manual/reject\n"
+            f"  /steam_setvac on/off\n"
+            f"  /steam_setlevel <数字>\n"
+            f"  /steam_setmingames <数字>\n"
+            f"  /steam_enable on/off"
+        )
+
+    @filter.command("steam_setgame")
+    async def cmd_setgame(self, event: AstrMessageEvent, args: str = ""):
+        """设置必需游戏: /steam_setgame 4000 或 /steam_setgame 4000,730 或 /steam_setgame clear"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        if not args.strip():
+            yield event.plain_result("用法: /steam_setgame 4000  或  /steam_setgame 4000,730  或  /steam_setgame clear")
+            return
+        if args.strip().lower() == "clear":
+            self._set_gs(gid, "required_game_appids", [])
+            yield event.plain_result("✅ 已清空必需游戏（所有申请将交手动审核）")
+            return
+        try:
+            appids = [int(x.strip()) for x in args.replace("，", ",").split(",") if x.strip()]
+        except ValueError:
+            yield event.plain_result("❌ 格式错误，AppID 必须是数字，多个用逗号分隔")
+            return
+        self._set_gs(gid, "required_game_appids", appids)
+        names = ", ".join(str(a) for a in appids)
+        yield event.plain_result(f"✅ 必需游戏已设为: {names}\n（4000=GMod, 730=CS2, 578080=PUBG ...）")
+
+    @filter.command("steam_autopass")
+    async def cmd_autopass(self, event: AstrMessageEvent, switch: str = ""):
+        """命中游戏自动通过: /steam_autopass on/off"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        if switch.lower() not in ("on", "off"):
+            yield event.plain_result("用法: /steam_autopass on 或 /steam_autopass off")
+            return
+        val = switch.lower() == "on"
+        self._set_gs(gid, "auto_approve_on_match", val)
+        yield event.plain_result(f"✅ 命中游戏自动通过: {'开启' if val else '关闭'}")
+
+    @filter.command("steam_nogame")
+    async def cmd_nogame(self, event: AstrMessageEvent, action: str = ""):
+        """无必需游戏时: /steam_nogame manual 或 /steam_nogame reject"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        if action.lower() not in ("manual", "reject"):
+            yield event.plain_result("用法: /steam_nogame manual (手动审核) 或 /steam_nogame reject (自动拒绝)")
+            return
+        self._set_gs(gid, "no_game_action", action.lower())
+        txt = "手动审核" if action.lower() == "manual" else "自动拒绝"
+        yield event.plain_result(f"✅ 没有必需游戏时: {txt}")
+
+    @filter.command("steam_setvac")
+    async def cmd_setvac(self, event: AstrMessageEvent, switch: str = ""):
+        """VAC自动拒绝: /steam_setvac on/off"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        if switch.lower() not in ("on", "off"):
+            yield event.plain_result("用法: /steam_setvac on 或 /steam_setvac off")
+            return
+        val = switch.lower() == "on"
+        self._set_gs(gid, "auto_reject_vac", val)
+        yield event.plain_result(f"✅ VAC自动拒绝: {'开启' if val else '关闭'}")
+
+    @filter.command("steam_setlevel")
+    async def cmd_setlevel(self, event: AstrMessageEvent, num: str = ""):
+        """最低等级: /steam_setlevel 5"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        try:
+            n = int(num)
+        except (ValueError, TypeError):
+            yield event.plain_result("用法: /steam_setlevel <数字>  (0=不限)")
+            return
+        self._set_gs(gid, "min_steam_level", n)
+        yield event.plain_result(f"✅ 最低Steam等级: {n}" if n else "✅ 不限制Steam等级")
+
+    @filter.command("steam_setmingames")
+    async def cmd_setmingames(self, event: AstrMessageEvent, num: str = ""):
+        """最低游戏数: /steam_setmingames 5"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        try:
+            n = int(num)
+        except (ValueError, TypeError):
+            yield event.plain_result("用法: /steam_setmingames <数字>  (0=不限)")
+            return
+        self._set_gs(gid, "min_games_count", n)
+        yield event.plain_result(f"✅ 最低游戏数: {n}" if n else "✅ 不限制游戏数")
+
+    @filter.command("steam_enable")
+    async def cmd_enable(self, event: AstrMessageEvent, switch: str = ""):
+        """启用/禁用本群审核: /steam_enable on/off"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if raw.get("sender", {}).get("role", "member") not in ("admin", "owner"):
+            yield event.plain_result("⚠ 仅管理员可操作")
+            return
+        gid = str(raw.get("group_id", ""))
+        if not gid:
+            yield event.plain_result("⚠ 请在群内使用")
+            return
+        if switch.lower() not in ("on", "off"):
+            yield event.plain_result("用法: /steam_enable on 或 /steam_enable off")
+            return
+        val = switch.lower() == "on"
+        self._set_gs(gid, "enabled", val)
+        yield event.plain_result(f"✅ 本群Steam审核: {'已启用' if val else '已禁用'}")
     async def terminate(self):
         self.pending.clear()
         self.processed_flags.clear()
-        logger.info("[SteamVerify] 插件已卸载")
+        self._save_group_settings()
+        self._save_bindings()
+        logger.info("[SteamVerify] 插件已卸载，数据已保存")
