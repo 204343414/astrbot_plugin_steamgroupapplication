@@ -5,47 +5,6 @@
     "default": "",
     "required": true
   },
-  "monitored_groups": {
-    "description": "监控的群号列表（空=全部群）",
-    "type": "list",
-    "items": {
-      "type": "string"
-    },
-    "default": []
-  },
-  "notify_group_id": {
-    "description": "审核卡片发到哪个群（留空=发到申请的群）",
-    "type": "string",
-    "default": ""
-  },
-  "auto_reject_vac": {
-    "description": "自动拒绝有VAC封禁的玩家",
-    "type": "bool",
-    "default": false
-  },
-  "min_steam_level": {
-    "description": "最低Steam等级（0=不限）",
-    "type": "int",
-    "default": 0
-  },
-  "min_games_count": {
-    "description": "最低游戏数（0=不限）",
-    "type": "int",
-    "default": 0
-  },
-    "required_game_appids": {
-    "description": "拥有此游戏自动通过（4000=GMod, 730=CS2）",
-    "type": "list",
-    "items": {
-      "type": "int"
-    },
-    "default": [4000]
-  },
-  "no_game_action": {
-    "description": "没有必需游戏时：manual=发卡片手动审核, reject=自动拒绝",
-    "type": "string",
-    "default": "manual"
-  },
   "card_expire_minutes": {
     "description": "审核卡片过期时间（分钟）",
     "type": "int",
