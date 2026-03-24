@@ -1,0 +1,44 @@
+{
+  "steam_api_key": {
+    "description": "Steam Web API Key（在 https://steamcommunity.com/dev/apikey 申请）",
+    "type": "string",
+    "default": "",
+    "required": true
+  },
+  "monitored_groups": {
+    "description": "需要监控加群申请的群号列表，为空则监控所有群",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "auto_reject_vac": {
+    "description": "是否自动拒绝有 VAC 封禁的玩家",
+    "type": "bool",
+    "default": false
+  },
+  "min_steam_level": {
+    "description": "最低 Steam 等级要求（0 表示不限制）",
+    "type": "int",
+    "default": 0
+  },
+  "min_games_count": {
+    "description": "最低游戏数量要求（0 表示不限制）",
+    "type": "int",
+    "default": 0
+  },
+  "required_game_appids": {
+    "description": "申请者必须拥有的游戏 AppID 列表（如 [730] 表示必须有 CS2）",
+    "type": "list",
+    "items": {
+      "type": "int"
+    },
+    "default": []
+  },
+  "card_expire_minutes": {
+    "description": "审核卡片过期时间（分钟），超时后管理员无法再通过引用审批",
+    "type": "int",
+    "default": 1440
+  }
+}
