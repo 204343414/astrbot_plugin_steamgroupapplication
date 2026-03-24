@@ -45,7 +45,7 @@
     "description": "没有必需游戏时：manual=发卡片手动审核, reject=自动拒绝",
     "type": "string",
     "default": "manual"
-  }，
+  },
   "card_expire_minutes": {
     "description": "审核卡片过期时间（分钟）",
     "type": "int",
