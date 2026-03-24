@@ -691,7 +691,6 @@ class SteamVerifyPlugin(Star):
             # 同一人退群重新申请，清除旧绑定让他走正常流程
             logger.info(f"[SteamVerify] QQ{user_id} 重新申请，清除旧绑定")
         elif dup_qq:
-        if dup_qq and dup_qq != user_id:
             await client.send_group_msg(
                 group_id=notify_gid,
                 message=[{"type": "text", "data": {"text":
