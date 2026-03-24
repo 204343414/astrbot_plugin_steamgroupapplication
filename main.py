@@ -437,6 +437,7 @@ class SteamVerifyPlugin(Star):
 
         # 启动后台轮询
         self._poll_task: Optional[asyncio.Task] = None
+        self._poll_started: bool = False
 
     def _init_clients(self):
         """根据配置初始化 API 客户端"""
@@ -459,12 +460,16 @@ class SteamVerifyPlugin(Star):
     #  AstrBot 加载完成后启动轮询
     # ----------------------------------------------------------
 
-    @filter.on_astrbot_loaded()
-    async def on_loaded(self):
-        """AstrBot 完全启动后，开始轮询加群请求"""
-        logger.info("[SteamVerify] AstrBot 已加载，启动加群请求轮询...")
-        if self._poll_task is None or self._poll_task.done():
+    def _ensure_poll_started(self):
+        """确保轮询任务在运行（惰性启动，第一次收到群消息时触发）"""
+        if self._poll_started and self._poll_task and not self._poll_task.done():
+            return
+        try:
             self._poll_task = asyncio.create_task(self._poll_loop())
+            self._poll_started = True
+            logger.info("[SteamVerify] ✅ 后台轮询任务已启动")
+        except Exception as e:
+            logger.error(f"[SteamVerify] 启动轮询失败: {e}")
 
     async def _poll_loop(self):
         """后台轮询：定期检查 NapCat 的群系统消息"""
@@ -485,15 +490,20 @@ class SteamVerifyPlugin(Star):
     async def _check_group_requests(self):
         """调用 get_group_system_msg 获取待处理的加群请求"""
         result = await self.napcat.get_group_system_msg()
+        logger.debug(f"[SteamVerify] get_group_system_msg 返回: {list(result.get('data', {}).keys()) if result.get('data') else 'empty'}")
         data = result.get("data", {})
         if not data:
             return
 
-        # NapCat 返回的字段：join_requests 或 InvitedRequest
-        join_list = data.get("join_requests", []) or []
-        # 有的版本字段不同，兼容一下
-        if not join_list:
-            join_list = data.get("joinRequests", []) or []
+        # NapCat 不同版本字段名不同，全部兼容
+        join_list = (
+            data.get("join_requests", [])
+            or data.get("joinRequests", [])
+            or data.get("join_list", [])
+            or data.get("filtered_join_requests", [])
+            or data.get("filteredJoinRequests", [])
+            or []
+        )
 
         monitored = [str(g) for g in self.config.get("monitored_groups", [])]
 
@@ -640,6 +650,9 @@ class SteamVerifyPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         """监听所有群消息，检查是否是对审核卡片的引用回复"""
+        # 惰性启动轮询（第一次收到群消息时自动拉起）
+        self._ensure_poll_started()
+
         if not self.pending_requests:
             return  # 没有待审核的就跳过
 
@@ -760,7 +773,12 @@ class SteamVerifyPlugin(Star):
         card_path.write_bytes(card_bytes)
 
         yield event.image_result(str(card_path))
-
+    @filter.command("steam_start")
+    async def manual_start(self, event: AstrMessageEvent):
+        """手动启动轮询: /steam_start"""
+        self._ensure_poll_started()
+        running = "✅ 运行中" if (self._poll_task and not self._poll_task.done()) else "❌ 未运行"
+        yield event.plain_result(f"🔄 轮询任务状态: {running}")
     @filter.command("steam_pending")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def show_pending(self, event: AstrMessageEvent):
@@ -780,6 +798,9 @@ class SteamVerifyPlugin(Star):
     @filter.command("steam_status")
     async def show_status(self, event: AstrMessageEvent):
         """查看插件状态: /steam_status"""
+        # 顺便确保轮询在跑
+        self._ensure_poll_started()
+
         steam_ok = "✅" if self.steam_api else "❌"
         napcat_ok = "✅" if self.napcat else "❌"
         poll_ok = "✅ 运行中" if (self._poll_task and not self._poll_task.done()) else "❌ 未运行"
