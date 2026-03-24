@@ -33,14 +33,19 @@
     "type": "int",
     "default": 0
   },
-  "required_game_appids": {
-    "description": "必须拥有的游戏AppID（如730=CS2）",
+    "required_game_appids": {
+    "description": "拥有此游戏自动通过（4000=GMod, 730=CS2）",
     "type": "list",
     "items": {
       "type": "int"
     },
-    "default": []
+    "default": [4000]
   },
+  "no_game_action": {
+    "description": "没有必需游戏时：manual=发卡片手动审核, reject=自动拒绝",
+    "type": "string",
+    "default": "manual"
+  }，
   "card_expire_minutes": {
     "description": "审核卡片过期时间（分钟）",
     "type": "int",
