@@ -687,7 +687,11 @@ class SteamVerifyPlugin(Star):
 
         # ---- 去重检查 ----
         dup_qq = self._check_steam_dup(group_id, steam64)
-        if dup_qq:
+        if dup_qq and dup_qq == user_id:
+            # 同一人退群重新申请，清除旧绑定让他走正常流程
+            logger.info(f"[SteamVerify] QQ{user_id} 重新申请，清除旧绑定")
+        elif dup_qq:
+        if dup_qq and dup_qq != user_id:
             await client.send_group_msg(
                 group_id=notify_gid,
                 message=[{"type": "text", "data": {"text":
@@ -701,7 +705,7 @@ class SteamVerifyPlugin(Star):
             try:
                 await client.set_group_add_request(
                     flag=flag, sub_type="add", approve=False,
-                    reason="Steam账号已被群内其他成员绑定"
+                    reason=f"该Steam账号已被群内QQ{dup_qq}使用，如有疑问请联系管理员"
                 )
             except Exception as e:
                 logger.error(f"[SteamVerify] 拒绝失败: {e}")
