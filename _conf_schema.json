@@ -1,55 +1,59 @@
 {
   "steam_api_key": {
-    "description": "Steam Web API Key（https://steamcommunity.com/dev/apikey 申请）",
+    "description": "Steam Web API Key",
     "type": "string",
     "default": "",
     "required": true
   },
   "napcat_http_url": {
-    "description": "NapCat 的 HTTP API 地址（如 http://127.0.0.1:3000），必填",
+    "description": "NapCat HTTP API 地址",
     "type": "string",
-    "default": "http://127.0.0.1:6099"
+    "default": "http://127.0.0.1:6099",
     "required": true
   },
   "napcat_token": {
-    "description": "NapCat 的 access_token（如果设置了鉴权的话）",
+    "description": "NapCat access_token（没设鉴权就留空）",
     "type": "string",
     "default": ""
   },
   "monitored_groups": {
-    "description": "需要监控加群申请的群号列表，为空则监控所有群",
+    "description": "监控加群申请的群号列表（空=全部群）",
     "type": "list",
-    "items": { "type": "string" },
+    "items": {
+      "type": "string"
+    },
     "default": []
   },
   "notify_group_id": {
-    "description": "审核卡片发送到哪个群（留空则发送到申请的目标群）",
+    "description": "审核卡片发到哪个群（留空=发到申请的群）",
     "type": "string",
     "default": ""
   },
   "auto_reject_vac": {
-    "description": "是否自动拒绝有 VAC 封禁的玩家",
+    "description": "自动拒绝有VAC封禁的玩家",
     "type": "bool",
     "default": false
   },
   "min_steam_level": {
-    "description": "最低 Steam 等级要求（0=不限制）",
+    "description": "最低Steam等级要求（0=不限）",
     "type": "int",
     "default": 0
   },
   "min_games_count": {
-    "description": "最低游戏数量要求（0=不限制）",
+    "description": "最低游戏数量要求（0=不限）",
     "type": "int",
     "default": 0
   },
   "required_game_appids": {
-    "description": "必须拥有的游戏 AppID 列表（如 [730] = CS2）",
+    "description": "必须拥有的游戏AppID列表",
     "type": "list",
-    "items": { "type": "int" },
+    "items": {
+      "type": "int"
+    },
     "default": []
   },
   "poll_interval": {
-    "description": "轮询加群请求的间隔秒数",
+    "description": "轮询加群请求间隔秒数",
     "type": "int",
     "default": 10
   },
