@@ -3,6 +3,6 @@ display_name: Steam 加群审核
 description: 监听加群申请中的 SteamID，爬取 Steam 资料生成卡片发到群里，管理员引用回复同意/拒绝即可自动审批
 author: ハ·7
 version: 1.0.0
-repo: https://github.com/yourname/astrbot_plugin_steam_verify
+repo: https://github.com/204343414/astrbot_plugin_steamgroupapplication
 support_platforms:
   - aiocqhttp   # NapCat/OneBot v11 适配器
