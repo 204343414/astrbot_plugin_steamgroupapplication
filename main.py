@@ -1,12 +1,9 @@
 """
 AstrBot Plugin: Steam 加群审核
-=================================
-流程:
-1. on_astrbot_loaded 启动后台轮询任务
-2. 定期通过 NapCat HTTP API 调用 get_group_system_msg 获取待处理加群请求
-3. 从验证消息中提取 SteamID → 调 Steam Web API 查资料
-4. 用 Pillow 绘卡片 → 通过 NapCat HTTP API send_group_msg 发到群里
-5. 群消息监听器捕获管理员引用回复 → 调 set_group_add_request 同意/拒绝
+================================
+蓝本: astrbot_plugin_auto_approve_all (已验证能捕获 request 事件)
+核心: event.bot (aiocqhttp client) 直接通过 WS 调 OneBot11 API
+不需要配置 HTTP 端口/token
 """
 
 import re
@@ -21,10 +18,12 @@ from pathlib import Path
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
-from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import AstrBotConfig
+from astrbot.api import logger
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 
 # ============================================================
 #  常量
@@ -32,19 +31,31 @@ from astrbot.api import AstrBotConfig
 
 STEAM_API_BASE = "https://api.steampowered.com"
 URL_PLAYER_SUMMARY = f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v2/"
-URL_PLAYER_BANS    = f"{STEAM_API_BASE}/ISteamUser/GetPlayerBans/v1/"
-URL_STEAM_LEVEL    = f"{STEAM_API_BASE}/IPlayerService/GetSteamLevel/v1/"
-URL_OWNED_GAMES    = f"{STEAM_API_BASE}/IPlayerService/GetOwnedGames/v1/"
-URL_RECENT_GAMES   = f"{STEAM_API_BASE}/IPlayerService/GetRecentlyPlayedGames/v1/"
+URL_PLAYER_BANS = f"{STEAM_API_BASE}/ISteamUser/GetPlayerBans/v1/"
+URL_STEAM_LEVEL = f"{STEAM_API_BASE}/IPlayerService/GetSteamLevel/v1/"
+URL_OWNED_GAMES = f"{STEAM_API_BASE}/IPlayerService/GetOwnedGames/v1/"
+URL_RECENT_GAMES = f"{STEAM_API_BASE}/IPlayerService/GetRecentlyPlayedGames/v1/"
 URL_RESOLVE_VANITY = f"{STEAM_API_BASE}/ISteamUser/ResolveVanityURL/v1/"
 
-RE_STEAM64     = re.compile(r'(?<!\d)(7656119\d{10})(?!\d)')
-RE_STEAMID     = re.compile(r'STEAM_([0-5]):([01]):(\d+)', re.IGNORECASE)
-RE_STEAM3      = re.compile(r'\[U:1:(\d+)\]')
-RE_CUSTOM_URL  = re.compile(r'(?:https?://)?steamcommunity\.com/id/([a-zA-Z0-9_-]+)', re.IGNORECASE)
-RE_PROFILE_URL = re.compile(r'(?:https?://)?steamcommunity\.com/profiles/(7656119\d{10})', re.IGNORECASE)
+RE_STEAM64 = re.compile(r"(?<!\d)(7656119\d{10})(?!\d)")
+RE_STEAMID = re.compile(r"STEAM_([0-5]):([01]):(\d+)", re.IGNORECASE)
+RE_STEAM3 = re.compile(r"\[U:1:(\d+)\]")
+RE_CUSTOM_URL = re.compile(
+    r"(?:https?://)?steamcommunity\.com/id/([a-zA-Z0-9_-]+)", re.IGNORECASE
+)
+RE_PROFILE_URL = re.compile(
+    r"(?:https?://)?steamcommunity\.com/profiles/(7656119\d{10})", re.IGNORECASE
+)
 
-PERSONA_STATE = {0:"离线",1:"在线",2:"忙碌",3:"离开",4:"打盹",5:"想交易",6:"想玩游戏"}
+PERSONA_STATE = {
+    0: "离线", 1: "在线", 2: "忙碌",
+    3: "离开", 4: "打盹", 5: "想交易", 6: "想玩游戏",
+}
+
+# 自动下载的字体保存路径
+FONT_DIR = Path("data/fonts")
+FONT_FILE = FONT_DIR / "LXGWWenKai-Regular.ttf"
+FONT_URL = "https://raw.githubusercontent.com/lxgw/LxgwWenKai/main/fonts/TTF/LXGWWenKai-Regular.ttf"
 
 
 # ============================================================
@@ -58,64 +69,12 @@ def steamid_to_steam64(s: str) -> Optional[str]:
         return str(76561197960265728 + z * 2 + y)
     return None
 
+
 def steam3_to_steam64(s: str) -> Optional[str]:
     m = RE_STEAM3.match(s)
     if m:
         return str(76561197960265728 + int(m.group(1)))
     return None
-
-
-# ============================================================
-#  NapCat HTTP API 封装
-# ============================================================
-
-class NapCatAPI:
-    """直接通过 HTTP 调用 NapCat 的 OneBot11 API"""
-
-    def __init__(self, base_url: str, token: str = ""):
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-
-    async def call(self, action: str, params: dict = None) -> dict:
-        url = f"{self.base_url}/{action}"
-        headers = {}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url, json=params or {},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        logger.error(f"[SteamVerify] NapCat API {action} HTTP {resp.status}")
-                        return {}
-                    data = await resp.json()
-                    return data
-        except Exception as e:
-            logger.error(f"[SteamVerify] NapCat API {action} 异常: {e}")
-            return {}
-
-    async def send_group_msg(self, group_id: str, message: list) -> dict:
-        """发送群消息，返回含 message_id 的结果"""
-        return await self.call("send_group_msg", {
-            "group_id": int(group_id),
-            "message": message
-        })
-
-    async def set_group_add_request(self, flag: str, sub_type: str,
-                                     approve: bool, reason: str = "") -> dict:
-        return await self.call("set_group_add_request", {
-            "flag": flag,
-            "sub_type": sub_type,
-            "approve": approve,
-            "reason": reason
-        })
-
-    async def get_group_system_msg(self) -> dict:
-        """获取群系统消息（包含加群请求）"""
-        return await self.call("get_group_system_msg")
 
 
 # ============================================================
@@ -131,8 +90,9 @@ class SteamAPI:
         params["format"] = "json"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
                     if resp.status != 200:
                         logger.error(f"[SteamVerify] Steam API {resp.status} {url}")
                         return {}
@@ -144,9 +104,7 @@ class SteamAPI:
     async def resolve_vanity_url(self, vanity: str) -> Optional[str]:
         data = await self._get(URL_RESOLVE_VANITY, {"vanityurl": vanity})
         resp = data.get("response", {})
-        if resp.get("success") == 1:
-            return resp.get("steamid")
-        return None
+        return resp.get("steamid") if resp.get("success") == 1 else None
 
     async def get_player_summary(self, steam64: str) -> dict:
         data = await self._get(URL_PLAYER_SUMMARY, {"steamids": steam64})
@@ -163,11 +121,10 @@ class SteamAPI:
         return data.get("response", {}).get("player_level", 0)
 
     async def get_owned_games(self, steam64: str) -> dict:
-        data = await self._get(URL_OWNED_GAMES, {
-            "steamid": steam64,
-            "include_appinfo": "1",
-            "include_played_free_games": "1",
-        })
+        data = await self._get(
+            URL_OWNED_GAMES,
+            {"steamid": steam64, "include_appinfo": "1", "include_played_free_games": "1"},
+        )
         return data.get("response", {})
 
     async def get_recent_games(self, steam64: str, count: int = 3) -> list:
@@ -177,7 +134,9 @@ class SteamAPI:
     async def download_image(self, url: str) -> Optional[Image.Image]:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
                     if resp.status == 200:
                         return Image.open(BytesIO(await resp.read()))
         except Exception as e:
@@ -211,27 +170,79 @@ async def extract_steam64(text: str, steam_api: SteamAPI) -> Optional[str]:
     text = text.strip()
 
     m = RE_PROFILE_URL.search(text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
 
     m = RE_CUSTOM_URL.search(text)
     if m:
         resolved = await steam_api.resolve_vanity_url(m.group(1))
-        if resolved: return resolved
+        if resolved:
+            return resolved
 
     m = RE_STEAM64.search(text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
 
     m = RE_STEAMID.search(text)
-    if m: return steamid_to_steam64(m.group(0))
+    if m:
+        return steamid_to_steam64(m.group(0))
 
     m = RE_STEAM3.search(text)
-    if m: return steam3_to_steam64(m.group(0))
+    if m:
+        return steam3_to_steam64(m.group(0))
 
-    # 兜底：纯字母数字当 vanity URL 试
+    # 兜底：整段像 vanity URL
     clean = text.split()[0] if text else ""
-    if clean and re.match(r'^[a-zA-Z0-9_-]{3,32}$', clean):
+    if clean and re.match(r"^[a-zA-Z0-9_-]{3,32}$", clean):
         resolved = await steam_api.resolve_vanity_url(clean)
-        if resolved: return resolved
+        if resolved:
+            return resolved
+
+    return None
+
+
+# ============================================================
+#  字体管理（自动下载中文字体，解决方框问题）
+# ============================================================
+
+async def ensure_font() -> Optional[str]:
+    """确保有可用的中文字体，没有就自动下载"""
+    # 1. 先检查系统自带的
+    system_fonts = [
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+    ]
+    for p in system_fonts:
+        if os.path.exists(p):
+            logger.info(f"[SteamVerify] 找到系统字体: {p}")
+            return p
+
+    # 2. 检查已下载的
+    if FONT_FILE.exists() and FONT_FILE.stat().st_size > 100000:
+        logger.info(f"[SteamVerify] 使用已下载字体: {FONT_FILE}")
+        return str(FONT_FILE)
+
+    # 3. 自动下载 LXGW WenKai（开源中文字体，约 8MB）
+    logger.info("[SteamVerify] 未找到中文字体，正在自动下载 LXGW WenKai ...")
+    FONT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(FONT_URL, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    FONT_FILE.write_bytes(data)
+                    logger.info(f"[SteamVerify] 字体下载完成: {FONT_FILE} ({len(data)} bytes)")
+                    return str(FONT_FILE)
+                else:
+                    logger.error(f"[SteamVerify] 字体下载失败: HTTP {resp.status}")
+    except Exception as e:
+        logger.error(f"[SteamVerify] 字体下载异常: {e}")
 
     return None
 
@@ -241,165 +252,162 @@ async def extract_steam64(text: str, steam_api: SteamAPI) -> Optional[str]:
 # ============================================================
 
 class CardRenderer:
-    BG_COLOR      = (30, 30, 30)
-    HEADER_COLOR  = (23, 26, 33)
-    TEXT_WHITE    = (255, 255, 255)
-    TEXT_GRAY     = (180, 180, 180)
-    TEXT_GREEN    = (87, 203, 222)
-    TEXT_RED      = (255, 77, 77)
-    TEXT_GOLD     = (255, 215, 0)
-    ACCENT_BLUE   = (66, 133, 244)
-    DIVIDER_COLOR = (60, 60, 60)
-    CARD_W = 600
-    PADDING = 20
+    BG       = (30, 30, 30)
+    HEADER   = (23, 26, 33)
+    WHITE    = (255, 255, 255)
+    GRAY     = (180, 180, 180)
+    CYAN     = (87, 203, 222)
+    RED      = (255, 77, 77)
+    GOLD     = (255, 215, 0)
+    BLUE     = (66, 133, 244)
+    DIVIDER  = (60, 60, 60)
+    W        = 600
+    PAD      = 20
 
-    def __init__(self):
-        self.font_path = self._find_font()
-        self.font_lg    = self._load_font(22)
-        self.font_md    = self._load_font(16)
-        self.font_sm    = self._load_font(13)
-        self.font_title = self._load_font(26)
+    def __init__(self, font_path: Optional[str] = None):
+        self.font_path = font_path
+        self.font_lg = self._load(22)
+        self.font_md = self._load(16)
+        self.font_sm = self._load(13)
+        self.font_xl = self._load(26)
 
-    def _find_font(self) -> Optional[str]:
-        candidates = [
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/System/Library/Fonts/PingFang.ttc",
-            "C:\\Windows\\Fonts\\msyh.ttc",
-            "C:\\Windows\\Fonts\\simhei.ttf",
-        ]
-        for p in candidates:
-            if os.path.exists(p): return p
-        return None
-
-    def _load_font(self, size: int):
-        try:
-            if self.font_path:
+    def _load(self, size: int):
+        if self.font_path:
+            try:
                 return ImageFont.truetype(self.font_path, size)
-        except Exception: pass
-        try:
-            return ImageFont.truetype("arial.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
-    def render(self, profile: dict, qq_id: str = "",
-               avatar_img: Image.Image = None) -> bytes:
-        summary      = profile.get("summary", {})
-        bans         = profile.get("bans", {})
-        level        = profile.get("level", 0)
-        game_count   = profile.get("game_count", 0)
-        recent_games = profile.get("recent_games", [])
-        steam64      = profile.get("steam64", "")
+    def render(self, profile: dict, qq_id: str = "", avatar_img: Image.Image = None) -> bytes:
+        s = profile.get("summary", {})
+        b = profile.get("bans", {})
+        steam64 = profile.get("steam64", "")
+        level = profile.get("level", 0)
+        game_count = profile.get("game_count", 0)
+        recent = profile.get("recent_games", [])
 
-        persona_name  = summary.get("personaname", "未知")
-        real_name     = summary.get("realname", "")
-        profile_url   = summary.get("profileurl", "")
-        persona_state = PERSONA_STATE.get(summary.get("personastate", 0), "未知")
-        time_created  = summary.get("timecreated", 0)
-        country_code  = summary.get("loccountrycode", "")
+        name = s.get("personaname", "未知")
+        real_name = s.get("realname", "")
+        url = s.get("profileurl", "")
+        state = PERSONA_STATE.get(s.get("personastate", 0), "未知")
+        created = s.get("timecreated", 0)
+        country = s.get("loccountrycode", "")
+        vis = s.get("communityvisibilitystate", 1)
+        vac = b.get("VACBanned", False)
+        vac_n = b.get("NumberOfVACBans", 0)
+        gb_n = b.get("NumberOfGameBans", 0)
+        cb = b.get("CommunityBanned", False)
 
-        vac_banned       = bans.get("VACBanned", False)
-        vac_count        = bans.get("NumberOfVACBans", 0)
-        game_bans_count  = bans.get("NumberOfGameBans", 0)
-        community_banned = bans.get("CommunityBanned", False)
+        # ---- 计算高度 ----
+        h = 120  # header
+        rows = 6 + (1 if real_name else 0)
+        h += 20 + rows * 30 + 20  # 基础信息
+        h += 2 + 15 + 30 + 3 * 30  # 封禁区
+        if recent:
+            h += 2 + 15 + 28 + min(len(recent), 5) * 26
+        h += 40  # 底部提示
 
-        # 动态高度
-        h = 20 + 90 + 10 + 2 + 15 + 30*7 + 15 + 2 + 15 + 30*3
-        if real_name: h += 30
-        if recent_games:
-            h += 15 + 2 + 15 + 25 + 28 * min(len(recent_games), 5)
-        h += 40
-
-        img = Image.new("RGB", (self.CARD_W, h), self.BG_COLOR)
+        img = Image.new("RGB", (self.W, h), self.BG)
         draw = ImageDraw.Draw(img)
-        p = self.PADDING
-        y = 15
+        p = self.PAD
+        y = 0
 
-        draw.rectangle([(0, 0), (self.CARD_W, y + 95)], fill=self.HEADER_COLOR)
+        # ---- Header 背景 ----
+        draw.rectangle([(0, 0), (self.W, 105)], fill=self.HEADER)
 
-        avatar_size = 72
+        # ---- 头像 ----
+        av_sz = 72
+        ax, ay = p, 16
         if avatar_img:
-            avatar_img = avatar_img.resize((avatar_size, avatar_size))
-            mask = Image.new("L", (avatar_size, avatar_size), 0)
+            av = avatar_img.resize((av_sz, av_sz))
+            mask = Image.new("L", (av_sz, av_sz), 0)
             ImageDraw.Draw(mask).rounded_rectangle(
-                [(0,0),(avatar_size-1,avatar_size-1)], radius=12, fill=255)
-            img.paste(avatar_img, (p, y+10), mask)
+                [(0, 0), (av_sz - 1, av_sz - 1)], radius=12, fill=255
+            )
+            img.paste(av, (ax, ay), mask)
         else:
             draw.rounded_rectangle(
-                [(p, y+10),(p+avatar_size, y+10+avatar_size)],
-                radius=12, fill=(80,80,80))
-            draw.text((p+20, y+30), "?", fill=self.TEXT_GRAY, font=self.font_lg)
+                [(ax, ay), (ax + av_sz, ay + av_sz)], radius=12, fill=(80, 80, 80)
+            )
+            draw.text((ax + 22, ay + 22), "?", fill=self.GRAY, font=self.font_lg)
 
-        nx = p + avatar_size + 15
-        draw.text((nx, y+12), persona_name, fill=self.TEXT_WHITE, font=self.font_title)
-        draw.text((nx, y+42), f"Steam64: {steam64}", fill=self.TEXT_GRAY, font=self.font_sm)
-        state_color = self.TEXT_GREEN if summary.get("personastate",0) > 0 else self.TEXT_GRAY
-        draw.text((nx, y+60), f"● {persona_state}", fill=state_color, font=self.font_sm)
+        # ---- 名字 / ID / 状态 ----
+        nx = ax + av_sz + 15
+        draw.text((nx, 18), name, fill=self.WHITE, font=self.font_xl)
+        draw.text((nx, 48), f"Steam64: {steam64}", fill=self.GRAY, font=self.font_sm)
+        sc = self.CYAN if s.get("personastate", 0) > 0 else self.GRAY
+        draw.text((nx, 68), f"● {state}", fill=sc, font=self.font_sm)
         if qq_id:
-            draw.text((self.CARD_W-p-140, y+60), f"QQ: {qq_id}",
-                       fill=self.TEXT_GRAY, font=self.font_sm)
+            draw.text((self.W - p - 130, 68), f"QQ: {qq_id}", fill=self.GRAY, font=self.font_sm)
 
-        y += 105
-        draw.rectangle([(p,y),(self.CARD_W-p,y+1)], fill=self.DIVIDER_COLOR)
-        y += 17
+        y = 110
 
-        def row(label, value, color=self.TEXT_WHITE):
+        # ---- 分割线 ----
+        def divider():
             nonlocal y
-            draw.text((p,y), label, fill=self.TEXT_GRAY, font=self.font_md)
-            draw.text((p+140,y), str(value), fill=color, font=self.font_md)
+            draw.rectangle([(p, y), (self.W - p, y + 1)], fill=self.DIVIDER)
+            y += 15
+
+        # ---- 信息行 ----
+        def row(label, value, color=self.WHITE):
+            nonlocal y
+            draw.text((p, y), label, fill=self.GRAY, font=self.font_md)
+            txt = str(value)
+            draw.text((p + 150, y), txt, fill=color, font=self.font_md)
             y += 30
 
-        row("🎮 Steam 等级", f"Lv.{level}", self.TEXT_GOLD)
-        row("📦 游戏数量", f"{game_count} 个")
+        divider()
+        row("🎮  Steam 等级", f"Lv.{level}", self.GOLD)
+        row("📦  游戏数量", f"{game_count} 个")
         if real_name:
-            row("👤 真实姓名", real_name)
-        row("🌐 国家/地区", country_code or "未公开")
-        row("📅 注册时间",
-            time.strftime("%Y-%m-%d", time.localtime(time_created)) if time_created else "未公开")
-        row("🔗 主页",
-            profile_url[:45]+"..." if len(profile_url)>45 else profile_url,
-            self.ACCENT_BLUE)
-        vis = summary.get("communityvisibilitystate", 1)
-        row("🔒 资料可见性",
-            "公开" if vis==3 else "私密/仅好友",
-            self.TEXT_GREEN if vis==3 else self.TEXT_RED)
+            row("👤  真实姓名", real_name)
+        row("🌐  国家/地区", country or "未公开")
+        row("📅  注册时间",
+            time.strftime("%Y-%m-%d", time.localtime(created)) if created else "未公开")
+        purl = url[:42] + "…" if len(url) > 42 else url
+        row("🔗  主页", purl, self.BLUE)
+        row("🔒  资料可见性",
+            "公开" if vis == 3 else "私密/仅好友",
+            self.CYAN if vis == 3 else self.RED)
 
         y += 5
-        draw.rectangle([(p,y),(self.CARD_W-p,y+1)], fill=self.DIVIDER_COLOR)
-        y += 17
+        divider()
 
-        draw.text((p,y), "⚠ 封禁信息", fill=self.TEXT_WHITE, font=self.font_lg)
+        # ---- 封禁信息 ----
+        draw.text((p, y), "⚠  封禁信息", fill=self.WHITE, font=self.font_lg)
         y += 30
         row("VAC 封禁",
-            f"有 ({vac_count}次)" if vac_banned else "无",
-            self.TEXT_RED if vac_banned else self.TEXT_GREEN)
+            f"有 ({vac_n}次)" if vac else "无",
+            self.RED if vac else self.CYAN)
         row("游戏封禁",
-            f"有 ({game_bans_count}次)" if game_bans_count else "无",
-            self.TEXT_RED if game_bans_count else self.TEXT_GREEN)
+            f"有 ({gb_n}次)" if gb_n else "无",
+            self.RED if gb_n else self.CYAN)
         row("社区封禁",
-            "是" if community_banned else "否",
-            self.TEXT_RED if community_banned else self.TEXT_GREEN)
+            "是" if cb else "否",
+            self.RED if cb else self.CYAN)
 
-        if recent_games:
+        # ---- 最近游玩 ----
+        if recent:
             y += 5
-            draw.rectangle([(p,y),(self.CARD_W-p,y+1)], fill=self.DIVIDER_COLOR)
-            y += 15
-            draw.text((p,y), "🕹 最近游玩", fill=self.TEXT_WHITE, font=self.font_lg)
+            divider()
+            draw.text((p, y), "🕹  最近游玩", fill=self.WHITE, font=self.font_lg)
             y += 28
-            for g in recent_games[:5]:
-                name = g.get("name","Unknown")
-                hours = round(g.get("playtime_2weeks",0)/60, 1)
-                draw.text((p+10,y), f"• {name}", fill=self.TEXT_WHITE, font=self.font_sm)
-                draw.text((self.CARD_W-p-100,y), f"{hours}h/2周",
-                          fill=self.TEXT_GRAY, font=self.font_sm)
-                y += 28
+            for g in recent[:5]:
+                gn = g.get("name", "Unknown")
+                hrs = round(g.get("playtime_2weeks", 0) / 60, 1)
+                draw.text((p + 10, y), f"• {gn}", fill=self.WHITE, font=self.font_sm)
+                draw.text((self.W - p - 100, y), f"{hrs}h/2周", fill=self.GRAY, font=self.font_sm)
+                y += 26
 
-        y += 10
-        draw.text((p,y), "💡 管理员请引用本消息回复「同意」或「拒绝」",
-                  fill=(120,120,120), font=self.font_sm)
+        # ---- 底部提示 ----
+        y += 12
+        draw.text(
+            (p, y),
+            "💡 管理员请引用本消息回复「同意」或「拒绝」",
+            fill=(120, 120, 120),
+            font=self.font_sm,
+        )
 
         buf = BytesIO()
         img.save(buf, "PNG")
@@ -413,299 +421,294 @@ class CardRenderer:
 @register(
     "astrbot_plugin_steam_verify",
     "YourName",
-    "Steam 加群审核插件",
+    "Steam 加群审核：抓取申请中的SteamID → 查资料出卡片 → 引用回复同意/拒绝",
     "1.0.0",
-    "https://github.com/yourname/astrbot_plugin_steam_verify"
+    "https://github.com/yourname/astrbot_plugin_steam_verify",
 )
 class SteamVerifyPlugin(Star):
 
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        # ★ 关键：config 由 AstrBot 框架注入，是个 dict-like 对象
-        self.config = config
-        self.renderer = CardRenderer()
 
-        # 待审核缓存: bot_msg_id(str) -> request_info
-        self.pending_requests: Dict[str, dict] = {}
-        # 已处理过的 flag 集合，防重复
+        # 配置
+        self.config: dict = config if config else {}
+
+        # Steam API
+        steam_key = self.config.get("steam_api_key", "")
+        self.steam_api = SteamAPI(steam_key) if steam_key else None
+
+        # 卡片渲染器（字体会在第一次使用时异步初始化）
+        self.renderer: Optional[CardRenderer] = None
+        self._font_ready = False
+
+        # 待审核: msg_id(str) -> {flag, sub_type, group_id, user_id, steam64, timestamp}
+        self.pending: Dict[str, dict] = {}
+        # 已处理的 flag，防重复
         self.processed_flags: set = set()
 
-        # 初始化 API 客户端
-        self.steam_api: Optional[SteamAPI] = None
-        self.napcat: Optional[NapCatAPI] = None
-        self._init_clients()
-
-        # 启动后台轮询
-        self._poll_task: Optional[asyncio.Task] = None
-        self._poll_started: bool = False
-
-    def _init_clients(self):
-        """根据配置初始化 API 客户端"""
-        steam_key = self.config.get("steam_api_key", "")
-        if steam_key:
-            self.steam_api = SteamAPI(steam_key)
-            logger.info("[SteamVerify] Steam API 已初始化")
+        if self.steam_api:
+            logger.info("[SteamVerify] ✅ Steam API 已初始化")
         else:
-            logger.error("[SteamVerify] ❌ 未配置 steam_api_key！")
+            logger.error("[SteamVerify] ❌ 未配置 steam_api_key")
 
-        napcat_url = self.config.get("napcat_http_url", "")
-        napcat_token = self.config.get("napcat_token", "")
-        if napcat_url:
-            self.napcat = NapCatAPI(napcat_url, napcat_token)
-            logger.info(f"[SteamVerify] NapCat API 已初始化: {napcat_url}")
-        else:
-            logger.error("[SteamVerify] ❌ 未配置 napcat_http_url！")
-
-    # ----------------------------------------------------------
-    #  AstrBot 加载完成后启动轮询
-    # ----------------------------------------------------------
-
-    def _ensure_poll_started(self):
-        """确保轮询任务在运行（惰性启动，第一次收到群消息时触发）"""
-        if self._poll_started and self._poll_task and not self._poll_task.done():
+    async def _ensure_renderer(self):
+        """首次使用时初始化渲染器（含字体下载）"""
+        if self._font_ready:
             return
-        try:
-            self._poll_task = asyncio.create_task(self._poll_loop())
-            self._poll_started = True
-            logger.info("[SteamVerify] ✅ 后台轮询任务已启动")
-        except Exception as e:
-            logger.error(f"[SteamVerify] 启动轮询失败: {e}")
+        font_path = await ensure_font()
+        self.renderer = CardRenderer(font_path)
+        self._font_ready = True
+        logger.info(f"[SteamVerify] 卡片渲染器已初始化, font={font_path}")
 
-    async def _poll_loop(self):
-        """后台轮询：定期检查 NapCat 的群系统消息"""
-        interval = self.config.get("poll_interval", 10)
-        # 等几秒让 NapCat 连接稳定
-        await asyncio.sleep(5)
+    # ==========================================================
+    #  核心事件监听（蓝本 = auto_approve_all 的写法，已验证能收到 request）
+    # ==========================================================
 
-        while True:
-            try:
-                if self.napcat and self.steam_api:
-                    await self._check_group_requests()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[SteamVerify] 轮询出错: {e}")
-            await asyncio.sleep(interval)
-
-    async def _check_group_requests(self):
-        """调用 get_group_system_msg 获取待处理的加群请求"""
-        result = await self.napcat.get_group_system_msg()
-        logger.debug(f"[SteamVerify] get_group_system_msg 返回: {list(result.get('data', {}).keys()) if result.get('data') else 'empty'}")
-        data = result.get("data", {})
-        if not data:
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def on_event(self, event: AstrMessageEvent):
+        """
+        统一入口：拦截 aiocqhttp 的所有事件
+        - post_type == "request" + request_type == "group" → 加群申请
+        - post_type == "message" + message_type == "group" → 群消息（检查管理员引用回复）
+        """
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
             return
 
-        # NapCat 不同版本字段名不同，全部兼容
-        join_list = (
-            data.get("join_requests", [])
-            or data.get("joinRequests", [])
-            or data.get("join_list", [])
-            or data.get("filtered_join_requests", [])
-            or data.get("filteredJoinRequests", [])
-            or []
+        post_type = raw.get("post_type")
+
+        # ---- 加群申请 ----
+        if post_type == "request" and raw.get("request_type") == "group":
+            sub_type = raw.get("sub_type", "")
+            if sub_type == "add":
+                await self._on_join_request(event, raw)
+            return  # request 事件不需要继续传播
+
+        # ---- 群消息（管理员引用回复审批） ----
+        if post_type == "message" and raw.get("message_type") == "group":
+            await self._on_group_msg(event, raw)
+            return
+
+    # ==========================================================
+    #  处理加群申请
+    # ==========================================================
+
+    async def _on_join_request(self, event: AstrMessageEvent, raw: dict):
+        """收到 request.group.add 事件"""
+        flag = str(raw.get("flag", ""))
+        group_id = str(raw.get("group_id", ""))
+        user_id = str(raw.get("user_id", ""))
+        comment = str(raw.get("comment", ""))  # 验证消息（SteamID 在这里）
+
+        if not flag or flag in self.processed_flags:
+            return
+        self.processed_flags.add(flag)
+
+        # 群过滤
+        monitored = [str(g) for g in self.config.get("monitored_groups", [])]
+        if monitored and group_id not in monitored:
+            return
+
+        logger.info(
+            f"[SteamVerify] 📨 加群申请: group={group_id} user={user_id} "
+            f"comment='{comment}' flag={flag}"
         )
 
-        monitored = [str(g) for g in self.config.get("monitored_groups", [])]
+        # 拿 client
+        if not isinstance(event, AiocqhttpMessageEvent):
+            logger.error("[SteamVerify] 事件非 AiocqhttpMessageEvent，跳过")
+            return
+        client = event.bot
 
-        for req in join_list:
-            # 提取字段（不同 NapCat 版本字段名可能不同）
-            flag     = str(req.get("request_id", "") or req.get("flag", "") or req.get("msg_seq", ""))
-            group_id = str(req.get("group_id", "") or req.get("groupId", ""))
-            user_id  = str(req.get("requester_uin", "") or req.get("user_id", "") or req.get("userId", ""))
-            comment  = str(req.get("message", "") or req.get("additional", "") or req.get("comment", ""))
-            checked  = req.get("checked", False) or req.get("is_handled", False)
-
-            # 跳过已处理的
-            if checked:
-                continue
-            if not flag or flag in self.processed_flags:
-                continue
-            # 群号过滤
-            if monitored and group_id not in monitored:
-                continue
-
-            self.processed_flags.add(flag)
-            logger.info(f"[SteamVerify] 新加群请求: 群{group_id} QQ{user_id} 消息: {comment}")
-
-            # 异步处理，不阻塞轮询
-            asyncio.create_task(
-                self._handle_join_request(flag, group_id, user_id, comment)
-            )
-
-    async def _handle_join_request(self, flag: str, group_id: str,
-                                    user_id: str, comment: str):
-        """处理单个加群请求"""
-        notify_group = self.config.get("notify_group_id", "") or group_id
-
-        # 1. 提取 SteamID
-        steam64 = await extract_steam64(comment, self.steam_api)
-        if not steam64:
-            # 没找到 SteamID，发提醒让管理员手动处理
-            await self.napcat.send_group_msg(notify_group, [
-                {"type": "text", "data": {"text":
-                    f"📨 新的加群申请\n"
-                    f"👤 QQ: {user_id}\n"
-                    f"📝 验证消息: {comment}\n"
-                    f"⚠ 未检测到有效的 Steam ID，请手动审核"
-                }}
-            ])
+        if not self.steam_api:
+            logger.error("[SteamVerify] steam_api_key 未配置，无法查询")
             return
 
-        # 2. 查 Steam 资料
-        logger.info(f"[SteamVerify] 查询 Steam 资料: {steam64}")
+        notify_gid = int(self.config.get("notify_group_id", "") or group_id)
+
+        # 提取 SteamID
+        steam64 = await extract_steam64(comment, self.steam_api)
+        if not steam64:
+            await client.send_group_msg(
+                group_id=notify_gid,
+                message=[
+                    {
+                        "type": "text",
+                        "data": {
+                            "text": (
+                                f"📨 新的加群申请\n"
+                                f"👤 QQ: {user_id}\n"
+                                f"📝 验证消息: {comment}\n"
+                                f"⚠ 未检测到有效 Steam ID，请手动审核"
+                            )
+                        },
+                    }
+                ],
+            )
+            return
+
+        # 查 Steam 资料
+        logger.info(f"[SteamVerify] 🔍 查询 Steam: {steam64}")
         profile = await self.steam_api.fetch_full_profile(steam64)
 
         if not profile.get("summary"):
-            await self.napcat.send_group_msg(notify_group, [
-                {"type": "text", "data": {"text":
-                    f"📨 加群申请 | QQ: {user_id}\n"
-                    f"🔍 Steam64: {steam64}\n"
-                    f"❌ 无法获取 Steam 资料（无效ID或私密）"
-                }}
-            ])
+            await client.send_group_msg(
+                group_id=notify_gid,
+                message=[
+                    {
+                        "type": "text",
+                        "data": {
+                            "text": (
+                                f"📨 加群申请 | QQ: {user_id}\n"
+                                f"Steam64: {steam64}\n"
+                                f"❌ 无法获取 Steam 资料（无效ID或私密）"
+                            )
+                        },
+                    }
+                ],
+            )
             return
 
-        # 3. 自动审核检查
-        bans       = profile.get("bans", {})
-        level      = profile.get("level", 0)
+        # ---- 自动审核 ----
+        bans = profile.get("bans", {})
+        level = profile.get("level", 0)
         game_count = profile.get("game_count", 0)
-
-        auto_reject_reason = None
+        auto_reject = None
 
         if self.config.get("auto_reject_vac") and bans.get("VACBanned"):
-            auto_reject_reason = "存在 VAC 封禁记录"
+            auto_reject = "存在 VAC 封禁"
 
         min_lvl = self.config.get("min_steam_level", 0)
-        if min_lvl > 0 and level < min_lvl:
-            auto_reject_reason = f"Steam 等级 {level} < 要求 {min_lvl}"
+        if min_lvl and level < min_lvl:
+            auto_reject = f"等级 {level} < {min_lvl}"
 
         min_g = self.config.get("min_games_count", 0)
-        if min_g > 0 and game_count < min_g:
-            auto_reject_reason = f"游戏数量 {game_count} < 要求 {min_g}"
+        if min_g and game_count < min_g:
+            auto_reject = f"游戏数 {game_count} < {min_g}"
 
-        req_appids = self.config.get("required_game_appids", [])
-        if req_appids:
+        req_apps = self.config.get("required_game_appids", [])
+        if req_apps:
             owned = {g.get("appid") for g in profile.get("games", [])}
-            missing = [str(a) for a in req_appids if a not in owned]
-            if missing:
-                auto_reject_reason = f"缺少必需游戏: {','.join(missing)}"
+            miss = [str(a) for a in req_apps if a not in owned]
+            if miss:
+                auto_reject = f"缺少游戏: {','.join(miss)}"
 
-        # 4. 下载头像 & 画卡片
-        avatar_url = (profile["summary"].get("avatarfull")
-                      or profile["summary"].get("avatarmedium", ""))
+        # ---- 画卡片 ----
+        await self._ensure_renderer()
+        avatar_url = profile["summary"].get("avatarfull") or profile["summary"].get("avatarmedium", "")
         avatar_img = await self.steam_api.download_image(avatar_url) if avatar_url else None
         card_bytes = self.renderer.render(profile, qq_id=user_id, avatar_img=avatar_img)
-
-        # 转 base64 给 NapCat 发图（不需要保存文件）
         card_b64 = base64.b64encode(card_bytes).decode()
 
-        # 5. 自动拒绝
-        if auto_reject_reason:
-            await self.napcat.send_group_msg(notify_group, [
-                {"type": "text", "data": {"text":
-                    f"📨 加群申请 | QQ: {user_id}\n❌ 已自动拒绝: {auto_reject_reason}"}},
-            ])
-            await self.napcat.send_group_msg(notify_group, [
-                {"type": "image", "data": {"file": f"base64://{card_b64}"}}
-            ])
-            await self.napcat.set_group_add_request(flag, "add", False, auto_reject_reason)
-            logger.info(f"[SteamVerify] 自动拒绝 QQ{user_id}: {auto_reject_reason}")
+        # ---- 自动拒绝 ----
+        if auto_reject:
+            await client.send_group_msg(
+                group_id=notify_gid,
+                message=[
+                    {"type": "text", "data": {"text": f"📨 QQ {user_id} 申请加群\n❌ 自动拒绝: {auto_reject}"}},
+                ],
+            )
+            await client.send_group_msg(
+                group_id=notify_gid,
+                message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
+            )
+            try:
+                await client.set_group_add_request(flag=flag, sub_type="add", approve=False, reason=auto_reject)
+                logger.info(f"[SteamVerify] 🚫 自动拒绝 QQ {user_id}: {auto_reject}")
+            except Exception as e:
+                logger.error(f"[SteamVerify] 自动拒绝失败: {e}")
             return
 
-        # 6. 发卡片，等管理员审批
-        # 先发文字提示
-        await self.napcat.send_group_msg(notify_group, [
-            {"type": "text", "data": {"text":
-                f"📨 新的加群申请\n"
-                f"👤 QQ: {user_id} | 群: {group_id}\n"
-                f"🎮 Steam: {profile['summary'].get('personaname','')} ({steam64})\n"
-                f"💡 请引用下方卡片回复「同意」或「拒绝」"
-            }}
-        ])
+        # ---- 发文字提示 ----
+        persona = profile["summary"].get("personaname", "")
+        await client.send_group_msg(
+            group_id=notify_gid,
+            message=[
+                {
+                    "type": "text",
+                    "data": {
+                        "text": (
+                            f"📨 新的加群申请\n"
+                            f"👤 QQ: {user_id} | 群: {group_id}\n"
+                            f"🎮 Steam: {persona} ({steam64})\n"
+                            f"💡 请引用下方卡片回复「同意」或「拒绝」"
+                        )
+                    },
+                }
+            ],
+        )
 
-        # 发图片卡片
-        send_result = await self.napcat.send_group_msg(notify_group, [
-            {"type": "image", "data": {"file": f"base64://{card_b64}"}}
-        ])
+        # ---- 发图片卡片 ----
+        try:
+            result = await client.send_group_msg(
+                group_id=notify_gid,
+                message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
+            )
+            # 拿 message_id
+            msg_id = None
+            if isinstance(result, dict):
+                msg_id = str(result.get("message_id", ""))
+            if msg_id and msg_id != "0" and msg_id != "None":
+                self.pending[msg_id] = {
+                    "flag": flag,
+                    "sub_type": "add",
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "steam64": steam64,
+                    "timestamp": time.time(),
+                }
+                logger.info(f"[SteamVerify] ✅ 卡片已发送 msg_id={msg_id}，等待审批")
+            else:
+                logger.warning(f"[SteamVerify] ⚠ 未获取到 msg_id: {result}")
+        except Exception as e:
+            logger.error(f"[SteamVerify] 发送卡片失败: {e}")
 
-        # 提取 message_id
-        bot_msg_id = str(send_result.get("data", {}).get("message_id", ""))
-        if bot_msg_id and bot_msg_id != "0":
-            self.pending_requests[bot_msg_id] = {
-                "flag": flag,
-                "sub_type": "add",
-                "group_id": group_id,
-                "user_id": user_id,
-                "steam64": steam64,
-                "timestamp": time.time(),
-            }
-            logger.info(f"[SteamVerify] 卡片已发送 msg_id={bot_msg_id}，等待审批")
-        else:
-            logger.warning(f"[SteamVerify] 发送卡片未获取到 message_id: {send_result}")
+    # ==========================================================
+    #  处理管理员引用回复（同意/拒绝）
+    # ==========================================================
 
-    # ----------------------------------------------------------
-    #  监听群消息：捕获管理员引用回复
-    # ----------------------------------------------------------
-
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def on_group_message(self, event: AstrMessageEvent):
-        """监听所有群消息，检查是否是对审核卡片的引用回复"""
-        # 惰性启动轮询（第一次收到群消息时自动拉起）
-        self._ensure_poll_started()
-
-        if not self.pending_requests:
-            return  # 没有待审核的就跳过
-
-        # 获取原始消息数据来找 reply 组件
-        raw_msg = getattr(event.message_obj, "raw_message", None)
-        message_chain = getattr(event.message_obj, "message", [])
-
-        # 从消息链中提取引用的 message_id
-        reply_msg_id = None
-
-        # message_chain 可能是 list[dict] 或 list[组件对象]
-        if isinstance(message_chain, list):
-            for seg in message_chain:
-                if isinstance(seg, dict):
-                    if seg.get("type") == "reply":
-                        reply_msg_id = str(seg.get("data", {}).get("id", ""))
-                        break
-                else:
-                    # AstrBot 消息组件对象
-                    seg_type = getattr(seg, "type", None)
-                    if seg_type and str(seg_type).lower() in ("reply", "reference"):
-                        seg_data = getattr(seg, "data", {})
-                        if isinstance(seg_data, dict):
-                            reply_msg_id = str(seg_data.get("id", ""))
-                        break
-
-        # 如果 message_chain 里没找到，尝试从 raw 里找
-        if not reply_msg_id and isinstance(raw_msg, str) and "[CQ:reply,id=" in raw_msg:
-            m = re.search(r'\[CQ:reply,id=(-?\d+)', raw_msg)
-            if m:
-                reply_msg_id = m.group(1)
-
-        if not reply_msg_id or reply_msg_id not in self.pending_requests:
+    async def _on_group_msg(self, event: AstrMessageEvent, raw: dict):
+        """群消息：检测管理员引用卡片回复"""
+        if not self.pending:
             return
 
-        # 检查权限：只有管理员/群主可以操作
-        if event.role != "admin":
-            # role 字段由 AstrBot 根据 sender.role 设置
-            # 有时可能没正确识别，这里放宽一下，也检查 raw
+        # 从 message 数组中找 reply 段和 text 段
+        msg_chain = raw.get("message", [])
+        if isinstance(msg_chain, str):
+            return  # CQ 码字符串格式，先不处理
+
+        reply_id = None
+        text_content = ""
+
+        for seg in msg_chain:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = seg.get("type", "")
+            seg_data = seg.get("data", {})
+            if seg_type == "reply":
+                reply_id = str(seg_data.get("id", ""))
+            elif seg_type == "text":
+                text_content += seg_data.get("text", "")
+
+        if not reply_id or reply_id not in self.pending:
             return
 
-        req_info = self.pending_requests[reply_msg_id]
+        # 检查发送者权限
+        sender = raw.get("sender", {})
+        role = sender.get("role", "member")
+        if role not in ("admin", "owner"):
+            return
+
+        req = self.pending[reply_id]
 
         # 过期检查
-        expire_min = self.config.get("card_expire_minutes", 1440)
-        if time.time() - req_info["timestamp"] > expire_min * 60:
-            del self.pending_requests[reply_msg_id]
-            yield event.plain_result("⏰ 该审核请求已过期，请手动处理。")
-            event.stop_event()
+        expire = self.config.get("card_expire_minutes", 1440)
+        if time.time() - req["timestamp"] > expire * 60:
+            del self.pending[reply_id]
             return
 
-        # 解析操作
-        text = event.message_str.strip().lower()
+        # 解析指令
+        text = text_content.strip().lower()
         approve = None
         reason = ""
 
@@ -713,114 +716,132 @@ class SteamVerifyPlugin(Star):
             approve = True
         elif any(text.startswith(k) for k in ("拒绝", "驳回", "reject", "deny", "no", "n")):
             approve = False
-            parts = event.message_str.strip().split(None, 1)
+            parts = text_content.strip().split(None, 1)
             if len(parts) > 1:
                 reason = parts[1]
+        else:
+            return  # 不是审批指令
 
-        if approve is None:
-            return  # 不是审批指令，忽略
+        # 拿 client
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return
+        client = event.bot
 
-        # 调用 NapCat API 处理请求
+        # 执行审批
         try:
-            await self.napcat.set_group_add_request(
-                req_info["flag"], req_info["sub_type"], approve, reason
+            await client.set_group_add_request(
+                flag=req["flag"],
+                sub_type=req["sub_type"],
+                approve=approve,
+                reason=reason,
             )
-            action = "✅ 已同意" if approve else "❌ 已拒绝"
+            result_text = "✅ 已同意" if approve else "❌ 已拒绝"
             if reason:
-                action += f"（理由：{reason}）"
-            action += f"\n👤 QQ: {req_info['user_id']}\n🎮 Steam: {req_info['steam64']}"
-            yield event.plain_result(action)
+                result_text += f"（{reason}）"
+            result_text += f"\n👤 QQ: {req['user_id']} | 🎮 Steam: {req['steam64']}"
+
+            gid = int(raw.get("group_id", req["group_id"]))
+            await client.send_group_msg(
+                group_id=gid,
+                message=[{"type": "text", "data": {"text": result_text}}],
+            )
+            logger.info(f"[SteamVerify] {'同意' if approve else '拒绝'} QQ {req['user_id']}")
         except Exception as e:
-            logger.error(f"[SteamVerify] 处理失败: {e}")
-            yield event.plain_result(f"❌ 处理失败: {e}")
+            logger.error(f"[SteamVerify] 审批失败: {e}")
         finally:
-            self.pending_requests.pop(reply_msg_id, None)
+            self.pending.pop(reply_id, None)
 
-        event.stop_event()  # 阻止后续 LLM 处理
+        event.stop_event()
 
-    # ----------------------------------------------------------
-    #  手动测试命令
-    # ----------------------------------------------------------
+    # ==========================================================
+    #  工具命令
+    # ==========================================================
 
     @filter.command("steam_lookup")
-    async def test_lookup(self, event: AstrMessageEvent, steam_input: str):
-        """手动查询 Steam 资料: /steam_lookup <SteamID或链接>"""
+    async def cmd_lookup(self, event: AstrMessageEvent, steam_input: str = ""):
+        """手动查 Steam 资料: /steam_lookup <SteamID或链接>"""
         if not self.steam_api:
-            yield event.plain_result("❌ 未配置 steam_api_key，请在插件设置中填写")
+            yield event.plain_result("❌ 未配置 steam_api_key")
+            return
+        if not steam_input:
+            yield event.plain_result("用法: /steam_lookup <Steam64 / 自定义URL / STEAM_X:X:X>")
             return
 
         steam64 = await extract_steam64(steam_input, self.steam_api)
         if not steam64:
-            yield event.plain_result(f"❌ 无法解析 Steam ID: {steam_input}")
+            yield event.plain_result(f"❌ 无法解析: {steam_input}")
             return
 
-        yield event.plain_result(f"🔍 正在查询 {steam64} ...")
+        yield event.plain_result(f"🔍 查询中 {steam64} ...")
 
         profile = await self.steam_api.fetch_full_profile(steam64)
         if not profile.get("summary"):
-            yield event.plain_result("❌ 未找到该 Steam 用户")
+            yield event.plain_result("❌ 未找到该用户")
             return
 
-        avatar_url = (profile["summary"].get("avatarfull")
-                      or profile["summary"].get("avatarmedium", ""))
-        avatar_img = await self.steam_api.download_image(avatar_url) if avatar_url else None
-        card_bytes = self.renderer.render(profile, avatar_img=avatar_img)
+        await self._ensure_renderer()
+        av_url = profile["summary"].get("avatarfull") or profile["summary"].get("avatarmedium", "")
+        av_img = await self.steam_api.download_image(av_url) if av_url else None
+        card = self.renderer.render(profile, avatar_img=av_img)
+        card_b64 = base64.b64encode(card).decode()
 
-        # 保存到 data 目录
-        tmp_dir = Path("data/temp")
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        card_path = tmp_dir / f"steam_card_{steam64}.png"
-        card_path.write_bytes(card_bytes)
+        # 用 client 发图（兼容性最好）
+        if isinstance(event, AiocqhttpMessageEvent):
+            client = event.bot
+            gid = getattr(event.message_obj, "group_id", None) or (
+                event.message_obj.raw_message.get("group_id") if isinstance(event.message_obj.raw_message, dict) else None
+            )
+            uid = getattr(event.message_obj, "user_id", None) or (
+                event.message_obj.raw_message.get("user_id") if isinstance(event.message_obj.raw_message, dict) else None
+            )
+            if gid:
+                await client.send_group_msg(
+                    group_id=int(gid),
+                    message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
+                )
+            elif uid:
+                await client.send_private_msg(
+                    user_id=int(uid),
+                    message=[{"type": "image", "data": {"file": f"base64://{card_b64}"}}],
+                )
+            else:
+                yield event.plain_result("⚠ 无法确定发送目标")
+        else:
+            yield event.plain_result("⚠ 当前仅支持 aiocqhttp 平台")
 
-        yield event.image_result(str(card_path))
-    @filter.command("steam_start")
-    async def manual_start(self, event: AstrMessageEvent):
-        """手动启动轮询: /steam_start"""
-        self._ensure_poll_started()
-        running = "✅ 运行中" if (self._poll_task and not self._poll_task.done()) else "❌ 未运行"
-        yield event.plain_result(f"🔄 轮询任务状态: {running}")
     @filter.command("steam_pending")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def show_pending(self, event: AstrMessageEvent):
+    async def cmd_pending(self, event: AstrMessageEvent):
         """查看待审核列表: /steam_pending"""
-        if not self.pending_requests:
+        if not self.pending:
             yield event.plain_result("📋 当前没有待审核的请求")
             return
         lines = ["📋 待审核列表:"]
-        for msg_id, info in self.pending_requests.items():
-            elapsed = int((time.time() - info["timestamp"]) / 60)
+        for mid, info in self.pending.items():
+            mins = int((time.time() - info["timestamp"]) / 60)
             lines.append(
                 f"  • QQ {info['user_id']} | Steam {info['steam64']} | "
-                f"群 {info['group_id']} | {elapsed}分钟前 | msg_id={msg_id}"
+                f"群 {info['group_id']} | {mins}分钟前"
             )
         yield event.plain_result("\n".join(lines))
 
     @filter.command("steam_status")
-    async def show_status(self, event: AstrMessageEvent):
+    async def cmd_status(self, event: AstrMessageEvent):
         """查看插件状态: /steam_status"""
-        # 顺便确保轮询在跑
-        self._ensure_poll_started()
-
-        steam_ok = "✅" if self.steam_api else "❌"
-        napcat_ok = "✅" if self.napcat else "❌"
-        poll_ok = "✅ 运行中" if (self._poll_task and not self._poll_task.done()) else "❌ 未运行"
-        monitored = self.config.get("monitored_groups", [])
-        mon_text = ", ".join(str(g) for g in monitored) if monitored else "全部群"
+        api_ok = "✅" if self.steam_api else "❌"
+        font_ok = "✅" if self._font_ready else "⏳ 首次使用时初始化"
+        mon = self.config.get("monitored_groups", [])
+        mon_txt = ", ".join(str(g) for g in mon) if mon else "全部群"
 
         yield event.plain_result(
             f"🔧 Steam 加群审核 插件状态\n"
-            f"Steam API: {steam_ok}\n"
-            f"NapCat API: {napcat_ok} ({self.config.get('napcat_http_url', '未配置')})\n"
-            f"轮询任务: {poll_ok}\n"
-            f"监控群: {mon_text}\n"
-            f"待审核数: {len(self.pending_requests)}\n"
-            f"已处理数: {len(self.processed_flags)}"
+            f"Steam API: {api_ok}\n"
+            f"字体/渲染: {font_ok}\n"
+            f"监控群: {mon_txt}\n"
+            f"待审核: {len(self.pending)}\n"
+            f"已处理: {len(self.processed_flags)}"
         )
 
     async def terminate(self):
-        """插件卸载"""
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-        self.pending_requests.clear()
+        self.pending.clear()
         self.processed_flags.clear()
         logger.info("[SteamVerify] 插件已卸载")
